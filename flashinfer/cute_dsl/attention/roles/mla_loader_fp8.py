@@ -30,6 +30,22 @@ from ..scheduler.mla_persistent import (
 )
 
 
+@cute.jit
+def _page_id(
+    tile_params: SimpleNamespace, logical_page: cutlass.Int32
+) -> cutlass.Int32:
+    """Page id for a request-local page index, or -1 past the request's pages.
+
+    A -1 coordinate makes the TMA copy out of bounds: it zero-fills shared
+    memory and still credits the barrier with the full box bytes, so padding
+    pages never reach P @ V, where the masked P = 0 does not cancel a NaN.
+    The table read is clamped to min(kv_page_count, row width).
+    """
+    page_bound = cutlass.min(tile_params.kv_page_count, tile_params.mPT.shape[0])
+    page_id = tile_params.mPT[cutlass.min(logical_page, page_bound - 1)]
+    return cutlass.select_(logical_page < page_bound, page_id, cutlass.Int32(-1))
+
+
 class MLAFP8LoaderKRole:
     """Q/K loader warp for FP8 MLA decode.
 
@@ -195,17 +211,16 @@ class MLAFP8LoaderKRole:
         )
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
         for i in cutlass.range_constexpr(page_per_tile):
-            k_idx[i] = (
-                common_params.mPT[k_index]
+            k_idx[i] = _page_id(
+                common_params,
+                k_index
                 if self.mma_qk_tiler[1] // self.page_size == 1
-                else common_params.mPT[
-                    (
-                        k_index * qk_params.tiled_mma_qk.thr_id.shape
-                        + common_params.blk_coord[0]
-                    )
-                    * page_per_tile
-                    + i
-                ]
+                else (
+                    k_index * qk_params.tiled_mma_qk.thr_id.shape
+                    + common_params.blk_coord[0]
+                )
+                * page_per_tile
+                + i,
             )
         return k_idx
 
@@ -280,6 +295,9 @@ class MLAFP8LoaderKRole:
                     blk_coord=blk_coord,
                     local_split_kv=local_split_kv,
                     mPT=common_params.mPT,
+                    kv_page_count=cute.ceil_div(
+                        cache_seqs[blk_coord[2]], self.page_size
+                    ),
                 )
                 self._setup_tma_partitions(tile_params, qk_params)
 
@@ -386,10 +404,9 @@ class MLAFP8LoaderVRole:
         page_per_subtile = ceil_div(page_per_tile, self.iterations_pv_k)
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
         for i in cutlass.range_constexpr(page_per_tile):
-            k_idx[i] = (
-                common_params.mPT[k_index]
-                if page_per_tile == 1
-                else common_params.mPT[k_index * page_per_tile + i]
+            k_idx[i] = _page_id(
+                common_params,
+                k_index if page_per_tile == 1 else k_index * page_per_tile + i,
             )
 
         for j in cutlass.range_constexpr(self.iterations_pv_n):
@@ -440,6 +457,9 @@ class MLAFP8LoaderVRole:
                     blk_coord=blk_coord,
                     local_split_kv=local_split_kv,
                     mPT=common_params.mPT,
+                    kv_page_count=cute.ceil_div(
+                        cache_seqs[blk_coord[2]], self.page_size
+                    ),
                 )
                 self._setup_tma_partitions(tile_params, v_params)
 

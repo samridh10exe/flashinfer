@@ -1377,6 +1377,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         load_k_pipeline=load_k_pipeline,
                         load_v_pipeline=load_v_pipeline,
                         mPT=mPT,
+                        kv_page_count=cute.ceil_div(
+                            cache_seqs[blk_coord[2]], self.page_size
+                        ),
                     )
                     tma_qk_params = SimpleNamespace(
                         tiled_mma_qk=tiled_mma_qk,
@@ -1440,6 +1443,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         local_split_kv=local_split_kv,
                         load_v_pipeline=load_v_pipeline,
                         mPT=mPT,
+                        kv_page_count=cute.ceil_div(
+                            cache_seqs[blk_coord[2]], self.page_size
+                        ),
                     )
                     tma_pv_params = SimpleNamespace(
                         tiled_mma_pv=tiled_mma_pv,
@@ -2310,6 +2316,23 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             )
 
     @cute.jit
+    def _page_id(
+        self, common_params: SimpleNamespace, logical_page: cutlass.Int32
+    ) -> cutlass.Int32:
+        """Page id for a request-local page index, or -1 past the request's pages.
+
+        A -1 coordinate makes the TMA copy out of bounds: it zero-fills shared
+        memory and still credits the barrier with the full box bytes, so padding
+        pages never reach P @ V, where the masked P = 0 does not cancel a NaN.
+        The table read is clamped to min(kv_page_count, row width).
+        """
+        page_bound = cutlass.min(
+            common_params.kv_page_count, common_params.mPT.shape[0]
+        )
+        page_id = common_params.mPT[cutlass.min(logical_page, page_bound - 1)]
+        return cutlass.select_(logical_page < page_bound, page_id, cutlass.Int32(-1))
+
+    @cute.jit
     def load_tma_qk_one_k_tile(
         self,
         common_params: SimpleNamespace,
@@ -2345,17 +2368,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
         for i in cutlass.range_constexpr(page_per_tile):
-            k_idx[i] = (
-                common_params.mPT[k_index]
+            k_idx[i] = self._page_id(
+                common_params,
+                k_index
                 if self.mma_qk_tiler[1] // self.page_size == 1
-                else common_params.mPT[
-                    (
-                        k_index * qk_params.tiled_mma_qk.thr_id.shape
-                        + common_params.blk_coord[0]
-                    )
-                    * page_per_tile
-                    + i
-                ]
+                else (
+                    k_index * qk_params.tiled_mma_qk.thr_id.shape
+                    + common_params.blk_coord[0]
+                )
+                * page_per_tile
+                + i,
             )
         # load q once at first iteration
         load_q_pipeline = common_params.load_q_pipeline
@@ -2428,10 +2450,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         page_per_subtile = ceil_div(page_per_tile, self.iterations_pv_k)
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
         for i in cutlass.range_constexpr(page_per_tile):
-            k_idx[i] = (
-                common_params.mPT[k_index]
-                if page_per_tile == 1
-                else common_params.mPT[k_index * page_per_tile + i]
+            k_idx[i] = self._page_id(
+                common_params,
+                k_index if page_per_tile == 1 else k_index * page_per_tile + i,
             )
         # get the mbar ptr from pipeline.
         tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(

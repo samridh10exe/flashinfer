@@ -882,22 +882,36 @@ _CUTE_DSL_TMA_TAIL = pytest.mark.xfail(
 
 
 @pytest.mark.parametrize(
-    "backend,region,page_size",
+    "backend,region,page_size,dtype_name",
     [
-        ("cutlass", "last_page_tail", 16),
-        ("cutlass", "last_page_tail", 64),
-        ("cutlass", "last_page_tail", 128),
-        ("cutlass", "table_padding", 16),
-        ("cutlass", "table_padding", 64),
-        ("cute-dsl-monolithic", "table_padding", 16),
-        ("cute-dsl-monolithic", "table_padding", 64),
-        ("cute-dsl-modular", "table_padding", 64),
+        ("cutlass", "last_page_tail", 16, "bf16"),
+        ("cutlass", "last_page_tail", 64, "bf16"),
+        ("cutlass", "last_page_tail", 128, "bf16"),
+        ("cutlass", "table_padding", 16, "bf16"),
+        ("cutlass", "table_padding", 64, "bf16"),
+        ("cute-dsl-monolithic", "table_padding", 16, "bf16"),
+        ("cute-dsl-monolithic", "table_padding", 64, "bf16"),
+        ("cute-dsl-modular", "table_padding", 64, "bf16"),
+        ("cute-dsl-monolithic", "table_padding", 16, "fp8"),
+        ("cute-dsl-monolithic", "table_padding", 64, "fp8"),
+        ("cute-dsl-modular", "table_padding", 64, "fp8"),
         pytest.param(
-            "cute-dsl-monolithic", "last_page_tail", 64, marks=_CUTE_DSL_TMA_TAIL
+            "cute-dsl-monolithic",
+            "last_page_tail",
+            64,
+            "bf16",
+            marks=_CUTE_DSL_TMA_TAIL,
+        ),
+        pytest.param(
+            "cute-dsl-monolithic",
+            "last_page_tail",
+            64,
+            "fp8",
+            marks=_CUTE_DSL_TMA_TAIL,
         ),
     ],
 )
-def test_batch_mla_nan_outside_kv_len(backend, region, page_size):
+def test_batch_mla_nan_outside_kv_len(backend, region, page_size, dtype_name):
     # Like test_batch_mla_oob_kv_nan, for the SM100 backends and dense-table padding
     # pages (#6860, #6861): masked P = 0 does not cancel NaN in V rows past kv_len.
     device = torch.device("cuda:0")
@@ -914,6 +928,7 @@ def test_batch_mla_nan_outside_kv_len(backend, region, page_size):
             pytest.skip("CuTe DSL MLA requires SM100 or SM103")
 
     torch.manual_seed(42)
+    dtype = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}[dtype_name]
     num_heads, head_dim_ckv, head_dim_kpe = 128, 512, 64
     kv_lens = [page_size - 1, page_size + 1, 2 * 128 + 3]
     num_pages = [math.ceil(n / page_size) for n in kv_lens]
@@ -939,6 +954,7 @@ def test_batch_mla_nan_outside_kv_len(backend, region, page_size):
         dtype=torch.bfloat16,
         device=device,
     )
+    q, cache = q.to(dtype), cache.to(dtype)
     poisoned = cache.clone()
     if region == "last_page_tail":
         for start, n, kv_len in zip(starts, num_pages, kv_lens, strict=True):
@@ -968,16 +984,25 @@ def test_batch_mla_nan_outside_kv_len(backend, region, page_size):
             sm_scale=1.0 / ((128 + 64) ** 0.5),
             q_data_type=q.dtype,
             kv_data_type=kv_cache.dtype,
+            output_dtype=torch.bfloat16,
             query_layout="packed",
             kv_cache_layout="packed",
             lse_mode="none",
         )
-        out = torch.empty_like(q[..., :head_dim_ckv])
+        out = torch.empty(
+            q.shape[0], num_heads, head_dim_ckv, dtype=torch.bfloat16, device=device
+        )
         wrapper.run(query=q, kv_cache=kv_cache, out=out)
         return out
 
-    o_ref = run_mla("fa2", cache)
-    torch.testing.assert_close(run_mla(backend, poisoned), o_ref, rtol=1e-2, atol=1e-2)
+    if dtype_name == "fp8":
+        # FA2 has no FP8 path; storage outside kv_len must not change the output.
+        assert torch.equal(run_mla(backend, poisoned), run_mla(backend, cache))
+    else:
+        o_ref = run_mla("fa2", cache)
+        torch.testing.assert_close(
+            run_mla(backend, poisoned), o_ref, rtol=1e-2, atol=1e-2
+        )
 
 
 # ───────────────────────────────────────────────────────────────────────────
