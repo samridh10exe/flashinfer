@@ -1252,6 +1252,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                         sPT=sPT,
                         tidx=tidx,
                         page_size=mCL.shape[0],
+                        kv_page_count=cute.ceil_div(
+                            cache_seqs[blk_coord[2]], self.page_size
+                        ),
                     )
                     load_pt_producer_state = self.load_page_table(
                         load_pt_common_params,
@@ -1827,6 +1830,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         page_per_tile = self.mma_qk_tiler[1] // self.page_size
         tidx = common_params.tidx % self.threads_per_warp
 
+        # Slots past the request's last page get page -1: the TMA copy is then
+        # out of bounds and zero-fills, so padding pages never reach P @ V,
+        # where the masked P = 0 would not cancel a NaN.
+        page_bound = cutlass.min(common_params.kv_page_count, mPT.shape[0])
         load_pt_pipeline = common_params.load_pt_pipeline
         while k_tile_count > 0:
             load_pt_pipeline.producer_acquire(load_pt_producer_state)
@@ -1845,7 +1852,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             for i in range(elem_per_thread):
                 idx = i * self.threads_per_warp + tidx
                 if cute.elem_less(
-                    k_index * page_per_tile + idx, mPT.shape[0]
+                    k_index * page_per_tile + idx, page_bound
                 ) and cute.elem_less(idx, page_per_tile):
                     cute.copy(
                         atom_async_copy,
@@ -1853,7 +1860,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                         sPT_for_copy[None, idx, load_pt_producer_state.index],
                     )
                 else:
-                    sPT_for_copy[None, idx, load_pt_producer_state.index].fill(0)
+                    sPT_for_copy[None, idx, load_pt_producer_state.index].fill(-1)
             mbar_ptr = load_pt_pipeline.producer_get_barrier(load_pt_producer_state)  # noqa: F841
             load_pt_pipeline.producer_commit(load_pt_producer_state)
             load_pt_producer_state.advance()

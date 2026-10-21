@@ -82,6 +82,13 @@ class MLAPageTableLoaderRole:
             mPT_seq = mPT[None, blk_coord[2]]
             mPT_for_copy = cute.flat_divide(mPT_seq, (1,))
             sPT_for_copy = cute.flat_divide(sPT, (1,))
+            # Slots past the request's last page get page -1: the TMA copy is then
+            # out of bounds and zero-fills, so padding pages never reach P @ V,
+            # where the masked P = 0 would not cancel a NaN.
+            page_bound = cutlass.min(
+                cute.ceil_div(cache_seqs[blk_coord[2]], self.page_size),
+                mPT_seq.shape[0],
+            )
 
             while k_tile_count > 0:
                 handle = load_pt_producer.acquire_and_advance()
@@ -89,7 +96,7 @@ class MLAPageTableLoaderRole:
                 for i in range(elem_per_thread):
                     idx = i * self.threads_per_warp + tidx
                     if cute.elem_less(
-                        k_index * page_per_tile + idx, mPT_seq.shape[0]
+                        k_index * page_per_tile + idx, page_bound
                     ) and cute.elem_less(idx, page_per_tile):
                         cute.copy(
                             atom_async_copy,
@@ -97,7 +104,7 @@ class MLAPageTableLoaderRole:
                             sPT_for_copy[None, idx, handle.index],
                         )
                     else:
-                        sPT_for_copy[None, idx, handle.index].fill(0)
+                        sPT_for_copy[None, idx, handle.index].fill(-1)
 
                 handle.commit()
                 k_index += 1

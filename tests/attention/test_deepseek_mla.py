@@ -32,6 +32,7 @@ from flashinfer.jit.attention import (
     gen_single_prefill_module,
 )
 from flashinfer.utils import (
+    get_compute_capability,
     has_flashinfer_jit_cache,
     is_sm90a_supported,
     is_sm100a_supported,
@@ -875,6 +876,11 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
     torch.testing.assert_close(o_ans, o_ref, rtol=1e-2, atol=1e-2)
 
 
+_CUTE_DSL_TMA_TAIL = pytest.mark.xfail(
+    strict=True, reason="#6861: TMA loads the last page whole; its tail must be finite"
+)
+
+
 @pytest.mark.parametrize(
     "backend,region,page_size",
     [
@@ -883,15 +889,29 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
         ("cutlass", "last_page_tail", 128),
         ("cutlass", "table_padding", 16),
         ("cutlass", "table_padding", 64),
+        ("cute-dsl-monolithic", "table_padding", 16),
+        ("cute-dsl-monolithic", "table_padding", 64),
+        ("cute-dsl-modular", "table_padding", 64),
+        pytest.param(
+            "cute-dsl-monolithic", "last_page_tail", 64, marks=_CUTE_DSL_TMA_TAIL
+        ),
     ],
 )
 def test_batch_mla_nan_outside_kv_len(backend, region, page_size):
     # Like test_batch_mla_oob_kv_nan, for the SM100 backends and dense-table padding
-    # pages (#6860): masked P = 0 does not cancel NaN in V rows past kv_len.
+    # pages (#6860, #6861): masked P = 0 does not cancel NaN in V rows past kv_len.
     device = torch.device("cuda:0")
     clear_cuda_cache(device)
     if not is_sm100a_supported(device) and not is_sm110a_supported(device):
         pytest.skip("Requires SM100a or SM110a")
+    if backend.startswith("cute-dsl"):
+        from flashinfer.cute_dsl import is_cute_dsl_available
+
+        if not is_cute_dsl_available() or get_compute_capability(device) not in (
+            (10, 0),
+            (10, 3),
+        ):
+            pytest.skip("CuTe DSL MLA requires SM100 or SM103")
 
     torch.manual_seed(42)
     num_heads, head_dim_ckv, head_dim_kpe = 128, 512, 64
