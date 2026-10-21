@@ -774,6 +774,9 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     auto page_size = Pow2{mainloop_args.page_size};
     auto pages_per_tile = Pow2{TileShapeS{} / page_size};
     int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarp;
+    // Slots past the request's last page may hold padding or garbage ids; mapping them to
+    // page 0 keeps every gather address inside the KV pool.
+    int kv_page_count = ceil_div(K, mainloop_args.page_size);
 
 #if 1
     for (; k_tile_count > 0; ++k_index, --k_tile_count) {
@@ -784,9 +787,9 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < TileShapeS{}; i += cutlass::NumThreadsPerWarp) {
         int idx = i + thread_idx;
-        bool guard = idx < pages_per_tile;
         int smem_idx = pipeline_pt_producer_state.index() * TileShapeS::value + idx;
         int pt_idx = pages_per_tile * k_index + idx;
+        bool guard = idx < pages_per_tile && pt_idx < kv_page_count;
 
         cutlass::arch::cp_async_zfill<sizeof(int), cutlass::arch::CacheOperation::Always>(
             &shared_tensors.smem_page_table[smem_idx], &mPT(pt_idx), guard);
@@ -1043,11 +1046,37 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
 
     page_table_stage = pipeline_pt_release_state.index();
 
+    // Only this last V tile can hold rows at or past kv_len (the last page's tail, or the
+    // zero-filled table slots after it). Zero-fill them: the masked P = 0 does not cancel
+    // a NaN there in P @ V. K needs no such guard, softmax overwrites those scores.
+    auto cCLT = make_identity_tensor(make_shape(D_latent, paged_K * paged_B));
+    auto tVCcCLT = thr_copy_vc.partition_S(cta_mma_pv.partition_B(
+        local_tile(cCLT, TileShapePV{}, make_coord(_, _, _), Step<X, _1, _1>{})));
+    auto copy_split_tail = [kv_len = int{K}](auto src, auto dst, auto crd) {
+      auto src_v = group_modes<1, rank_v<decltype(src)>>(src);
+      auto dst_v = group_modes<1, rank_v<decltype(dst)>>(dst);
+      auto crd_v = group_modes<1, rank_v<decltype(crd)>>(crd);
+
+      auto src_v_ptrs = make_tensor<Element*>(size<1>(src_v));
+      for (int i = 0; i < size<1>(src_v); i++) {
+        src_v_ptrs(i) = &src_v(_0{}, i);
+      }
+
+      Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, Element> atom;
+      for (int i = 0; i < size<1>(src_v); i++) {
+        auto src_v_i = make_tensor(make_gmem_ptr(src_v_ptrs(i)), make_shape(shape<0>(src_v)),
+                                   make_stride(make_stride(_1{}, _0{})));
+        // crd is (d, token)
+        atom.with(get<1>(crd_v(_0{}, i)) < kv_len).call(src_v_i, dst_v(_, i));
+      }
+    };
+
     for (int i = 0; i < IterationsPV_K; i++) {
       for (int j = 0; j < IterationsPV_N; j++) {
         load_stage([&](int index) {
-          copy_split(tiled_copy_vc, tVCgCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i),
-                     tVCsVC(_, _, _, _, index));
+          copy_split_tail(tVCgCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i),
+                          tVCsVC(_, _, _, _, index),
+                          tVCcCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i));
         });
       }
     }

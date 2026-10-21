@@ -875,6 +875,91 @@ def test_cutlass_mla(batch_size, max_seq_len, page_size, dtype):
     torch.testing.assert_close(o_ans, o_ref, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "backend,region,page_size",
+    [
+        ("cutlass", "last_page_tail", 16),
+        ("cutlass", "last_page_tail", 64),
+        ("cutlass", "last_page_tail", 128),
+        ("cutlass", "table_padding", 16),
+        ("cutlass", "table_padding", 64),
+    ],
+)
+def test_batch_mla_nan_outside_kv_len(backend, region, page_size):
+    # Like test_batch_mla_oob_kv_nan, for the SM100 backends and dense-table padding
+    # pages (#6860): masked P = 0 does not cancel NaN in V rows past kv_len.
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if not is_sm100a_supported(device) and not is_sm110a_supported(device):
+        pytest.skip("Requires SM100a or SM110a")
+
+    torch.manual_seed(42)
+    num_heads, head_dim_ckv, head_dim_kpe = 128, 512, 64
+    kv_lens = [page_size - 1, page_size + 1, 2 * 128 + 3]
+    num_pages = [math.ceil(n / page_size) for n in kv_lens]
+    pages_per_tile = 128 // page_size
+    width = math.ceil((max(num_pages) + 1) / pages_per_tile) * pages_per_tile
+    nan_page = sum(num_pages)
+    block_tables = torch.full((len(kv_lens), width), nan_page, dtype=torch.int32)
+    starts = [sum(num_pages[:i]) for i in range(len(kv_lens))]
+    for i, (start, n) in enumerate(zip(starts, num_pages, strict=True)):
+        block_tables[i, :n] = torch.arange(start, start + n)
+
+    q = torch.randn(
+        len(kv_lens),
+        num_heads,
+        head_dim_ckv + head_dim_kpe,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    cache = torch.randn(
+        nan_page + 1,
+        page_size,
+        head_dim_ckv + head_dim_kpe,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    poisoned = cache.clone()
+    if region == "last_page_tail":
+        for start, n, kv_len in zip(starts, num_pages, kv_lens, strict=True):
+            poisoned[start + n - 1, kv_len - (n - 1) * page_size :] = float("nan")
+    else:
+        poisoned[nan_page] = float("nan")
+
+    metadata = flashinfer.mla.MLAPlanMetadata.dense(
+        torch.arange(len(kv_lens) + 1, dtype=torch.int32),
+        block_tables,
+        torch.tensor(kv_lens, dtype=torch.int32),
+        1,
+    )
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    def run_mla(mla_backend, kv_cache):
+        wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+            workspace, backend=mla_backend
+        )
+        wrapper.plan(
+            metadata=metadata,
+            num_heads=num_heads,
+            head_dim_ckv=head_dim_ckv,
+            head_dim_kpe=head_dim_kpe,
+            page_size=page_size,
+            causal=False,
+            sm_scale=1.0 / ((128 + 64) ** 0.5),
+            q_data_type=q.dtype,
+            kv_data_type=kv_cache.dtype,
+            query_layout="packed",
+            kv_cache_layout="packed",
+            lse_mode="none",
+        )
+        out = torch.empty_like(q[..., :head_dim_ckv])
+        wrapper.run(query=q, kv_cache=kv_cache, out=out)
+        return out
+
+    o_ref = run_mla("fa2", cache)
+    torch.testing.assert_close(run_mla(backend, poisoned), o_ref, rtol=1e-2, atol=1e-2)
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # FP8 KV cache path (DeepSeek MLA, fa3 / SM90 only). Stores KV as FP8 e4m3
 # in shared memory and dequants one tile at a time to BF16 right before WGMMA.
